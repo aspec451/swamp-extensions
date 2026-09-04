@@ -1,0 +1,20 @@
+manifestVersion: 1
+name: "@aspec451/microsoft/sharepoint-lists"
+version: "2026.09.04.1"
+description: "SharePoint list items via the Microsoft Graph API — read and write rows on the list surface (public client, device code flow)"
+repository: "https://github.com/aspec451/swamp-extensions"
+models:
+  - microsoft/sharepoint_lists.ts
+additionalFiles:
+  - README.md
+  - LICENSE.md
+platforms:
+  - linux-x86_64
+  - linux-aarch64
+  - darwin-x86_64
+  - darwin-aarch64
+labels:
+  - microsoft
+  - microsoft365
+  - sharepoint
+  - graph-api
