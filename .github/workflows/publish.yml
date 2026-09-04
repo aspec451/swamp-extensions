@@ -1,0 +1,104 @@
+name: Publish Extension
+
+# Deliberately manual. Published versions are immutable and the adversarial
+# review gate is per-content-hash, so publishing is a decision, not a
+# side effect of a green build.
+on:
+  workflow_dispatch:
+    inputs:
+      extension:
+        description: "Extension directory (e.g. microsoft/sharepoint-lists)"
+        required: true
+        type: string
+      channel:
+        description: "Target channel"
+        required: true
+        default: stable
+        type: choice
+        options:
+          - stable
+          - beta
+          - rc
+
+# Serialize publishes, but never cancel one. `swamp extension push` writes to
+# the registry and published versions are immutable, so a cancelled run can
+# leave a version half-claimed with no way to redo it. Queue instead.
+concurrency:
+  group: publish-${{ inputs.extension }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: ${{ inputs.extension }} → ${{ inputs.channel }}
+    runs-on: ubuntu-latest
+    environment: registry
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify the extension directory exists
+        # `extension` is interpolated via env, not directly into the script.
+        # A `run:` block that expands ${{ inputs.* }} textually is a shell
+        # injection, and this job carries SWAMP_API_KEY via the `registry`
+        # environment — so an injected command could exfiltrate the registry
+        # credential, not merely publish.
+        env:
+          EXTENSION: ${{ inputs.extension }}
+        run: |
+          if [ ! -f "$EXTENSION/manifest.yaml" ]; then
+            echo "::error::No manifest.yaml at $EXTENSION"
+            exit 1
+          fi
+
+      - uses: systeminit/setup-swamp@v0.1.0
+        with:
+          api-key: ${{ secrets.SWAMP_API_KEY }}
+
+      - name: Extract manifest info
+        id: manifest
+        working-directory: ${{ inputs.extension }}
+        run: |
+          NAME=$(yq -r '.name' manifest.yaml)
+          VERSION=$(yq -r '.version' manifest.yaml)
+          if [ -z "$NAME" ] || [ -z "$VERSION" ] || [ "$NAME" = "null" ] || [ "$VERSION" = "null" ]; then
+            echo "::error::Failed to extract name or version from manifest.yaml"
+            exit 1
+          fi
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Extension: $NAME@$VERSION"
+
+      - name: Dry run
+        working-directory: ${{ inputs.extension }}
+        # SWAMP_EXTENSION_REVIEW_DIR points at the committed review reports so
+        # the content-hash-bound adversarial review gate is satisfied by a
+        # report in the repo rather than bypassed with --yes.
+        env:
+          SWAMP_EXTENSION_REVIEW_DIR: ${{ github.workspace }}/.extension-reviews
+        run: swamp extension push manifest.yaml --dry-run
+
+      - name: Publish
+        working-directory: ${{ inputs.extension }}
+        env:
+          SWAMP_EXTENSION_REVIEW_DIR: ${{ github.workspace }}/.extension-reviews
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          PUSH_ARGS=(swamp extension push manifest.yaml)
+          if [ "$CHANNEL" != "stable" ]; then
+            PUSH_ARGS+=(--channel "$CHANNEL")
+          fi
+          if [ -f RELEASE_NOTES.md ]; then
+            PUSH_ARGS+=(--release-notes "$(cat RELEASE_NOTES.md)")
+          fi
+          "${PUSH_ARGS[@]}"
+
+      - name: Summary
+        env:
+          EXT_NAME: ${{ steps.manifest.outputs.name }}
+          EXT_VERSION: ${{ steps.manifest.outputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          {
+            echo "### Published"
+            echo ""
+            echo "\`$EXT_NAME\`@\`$EXT_VERSION\` → $CHANNEL"
+          } >> "$GITHUB_STEP_SUMMARY"

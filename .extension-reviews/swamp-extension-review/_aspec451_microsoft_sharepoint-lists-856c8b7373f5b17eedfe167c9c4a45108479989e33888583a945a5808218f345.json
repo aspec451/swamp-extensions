@@ -1,0 +1,82 @@
+{
+  "extension": "@aspec451/microsoft/sharepoint-lists",
+  "version": "2026.09.04.1",
+  "reviewedAt": "2026-09-04T20:16:27Z",
+  "dimensions": [
+    {
+      "id": "credentials-secrets",
+      "verdict": "issue",
+      "note": "refreshToken is marked .meta({sensitive:true}) in both GlobalArgsSchema and BootstrapResultSchema, and no token is ever logged (bootstrap logs only the device user_code and verification URI, which are not secrets). Issue: the bootstrap spec persists the refresh token to the datastore with lifetime 'infinite' and garbageCollection 3, so up to three live refresh tokens sit in the datastore indefinitely \u2014 and in a team repo that datastore is shared storage. Consider a short lifetime or sensitiveOutput. Separately, the push analyzer's warning on `scopes` is a false positive: it holds a space-separated scope list, not a credential."
+    },
+    {
+      "id": "logging-quality",
+      "verdict": "issue",
+      "note": "Structured placeholders throughout, correct levels (info for progress, warn for the maxPages cap), no sensitive values in messages or props. Issue: no method logs on entry \u2014 only on completion. Each read method makes 2-4 sequential Graph calls (token refresh, resolve site, resolve list, fetch), so a mid-sequence failure gives no signal of how far it got beyond the thrown message."
+    },
+    {
+      "id": "error-handling",
+      "verdict": "issue",
+      "note": "withGraphContext prepends the failing operation and its identifying arguments and preserves the original GraphApiError as `cause`; every method throws before any writeResource, so no partial writes. Issue: resolveList (lines 371-381) wraps the direct list lookup in a bare `catch {}` that swallows every failure and falls through to display-name enumeration. A 401, 403 or 500 there is reported as 'No list on this site matches ...' \u2014 asserting non-existence for what may be an auth or server fault. Narrow the catch to 404/itemNotFound."
+    },
+    {
+      "id": "testing-completeness",
+      "verdict": "pass",
+      "note": "27 tests via createModelTestContext and withMockedFetch, covering success and failure paths: display-name fallback after a 404, the no-match error naming available lists, the truncated flag, Prefer header present and absent, empty-fields refused with no network call, delete refused without confirm, delete pre-image retention, and error-message propagation."
+    },
+    {
+      "id": "idempotency-resilience",
+      "verdict": "issue",
+      "note": "Issue: delete_item is not idempotent \u2014 the pre-delete GET throws on 404, so deleting an already-deleted item fails instead of succeeding. Also the pre-image is written AFTER the DELETE, so an interruption between the two loses the only record of what was removed (Graph cannot reach SharePoint's recycle bin); writing it before the delete would be safer. create_item has no 'already exists' path, but SharePoint list items have no natural key, so creating duplicates is correct semantics rather than a defect."
+    },
+    {
+      "id": "api-contracts",
+      "verdict": "issue",
+      "note": "Pagination is handled via @odata.nextLink with a page cap, and `truncated` is propagated to the two list-shaped specs. Issues: (1) no 429/503 or Retry-After handling anywhere \u2014 list_items permits up to 100 pages against a list surface Graph throttles aggressively, and a 429 mid-walk surfaces as a hard failure with the accumulated pages discarded; (2) graphRequest calls response.json() BEFORE checking response.ok, so a non-JSON error body (proxy 502, HTML error page) throws a JSON SyntaxError instead of reporting the HTTP status; (3) get_list and resolveList's fallback enumeration both discard the `truncated` flag that graphRequestPaginated returns."
+    },
+    {
+      "id": "resource-management",
+      "verdict": "pass",
+      "note": "No file handles, temp files, or long-lived connections; every response body is consumed by .json() on both success and error paths. Nothing to leak or track for cleanup."
+    },
+    {
+      "id": "published-surface-hygiene",
+      "verdict": "pass",
+      "note": "Pass with one deliberate, documented exception. The README setup snippet and the tenantId describe string carry the real Entra tenant GUID e9b2b7ba-b238-42a9-b271-2adfc82da650. This is intentional as of this change: CLAUDE.md's Published-Surface Hygiene section was amended in the same commit to exempt Entra tenant IDs, on the grounds that a tenant ID is not confidential \u2014 anyone can resolve it from a tenant domain via the OIDC discovery document at login.microsoftonline.com/<domain>/v2.0/.well-known/openid-configuration. The scrub commit that had replaced it with a placeholder was rebased out of unpushed history at the author's direction. The client ID remains a synthetic placeholder (11111111-2222-3333-4444-555555555555) and the amended rule keeps it that way: a real tenant ID plus a real client ID plus the scopes is the complete input to a device-code authorization request against that registration, so the pair is materially more useful to an attacker than the tenant half alone. The real client ID has never been present in this repo in full \u2014 the pre-scrub text was an elided first-octet fragment, which this change replaced with a proper placeholder rather than restoring, since an elided fragment is not a usable example value. Everything else remains synthetic: contoso.sharepoint.com throughout the README and fixtures, synthetic list and item GUIDs, and no internal hostnames, IPs, CIDRs or site names. Licensing disclosure from the prior review is intact and unchanged: LICENSE.md states 'Copyright 2026 aspec451' with a portions clause naming the two adapted _lib files, and both carry Apache-2.0 section 4(a) attribution plus a 4(b) statement of changes."
+    },
+    {
+      "id": "schema-strictness",
+      "verdict": "pass",
+      "note": "All five output specs are plain z.object with no .passthrough() or .loose(), so CEL expression validation works. The `fields` maps use z.record(z.string(), z.unknown()), which is required to carry arbitrary SharePoint columns and is not a passthrough escape hatch."
+    },
+    {
+      "id": "lifetime-gc",
+      "verdict": "pass",
+      "note": "All five specs declare both lifetime and garbageCollection, tuned per shape: 15m for the three cacheable reads, infinite for itemWrite (an audit record) and bootstrap. See credentials-secrets for the security consequence of bootstrap's infinite lifetime."
+    },
+    {
+      "id": "crud-completeness",
+      "verdict": "na",
+      "note": "create_item, update_item and delete_item cover the item write surface. There is no sync method, but this model reads a remote system of record rather than managing resource lifecycle \u2014 list_items is the read path and there is no local desired state to reconcile against."
+    },
+    {
+      "id": "preflight-checks",
+      "verdict": "issue",
+      "note": "The model declares no `checks` at all. All three mutating methods guard with inline throws instead (confirm !== true on delete, empty `fields` on create and update). Those guards are correct and fire before any network call, but as inline throws they cannot be surfaced ahead of execution, selectively skipped via --skip-check / --skip-check-label, or run without executing the method."
+    },
+    {
+      "id": "instance-names",
+      "verdict": "pass",
+      "note": "`lists` is always 'main' (single writer). listSchema and listItems are keyed by list slug in different specs, so no collision. itemWrite is written by three methods but names are prefixed create-/update-/delete- plus list and item ID, and all three write the same ItemWriteSchema shape. Minor residual: slug() truncates to 48 characters, so two lists sharing a 48-character prefix would collide within a spec."
+    },
+    {
+      "id": "data-access",
+      "verdict": "na",
+      "note": "No method reads back stored state \u2014 delete_item's pre-image comes from Graph, not the datastore, and the Context interface does not declare readResource. There is no direct dataRepository access to flag."
+    },
+    {
+      "id": "version-upgrades",
+      "verdict": "na",
+      "note": "Initial publish; the model version is not being bumped, so no upgrades entry is required. Note for later: the model's internal version (2026.09.03.1) and the manifest version (2026.09.04.1) differ, and the first real bump of the model version will need an upgrades entry or existing instances stay pinned to their old typeVersion forever."
+    }
+  ]
+}

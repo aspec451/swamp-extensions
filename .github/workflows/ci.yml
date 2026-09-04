@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Supersede in-flight runs for the same ref. Safe here because CI only reads —
+# nothing it does is destructive or partially observable if cancelled.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Single source of truth for the Deno version. Referenced by every setup-deno
+# invocation AND by the actions/cache key, so bumping this one value stays
+# consistent across both.
+env:
+  DENO_VERSION: "2.9.5"
+
+jobs:
+  discover:
+    # Derive the extension matrix from the filesystem: every directory holding a
+    # manifest.yaml is an extension. Adding one needs no workflow change.
+    name: Discover extensions
+    runs-on: ubuntu-latest
+    outputs:
+      extensions: ${{ steps.discover.outputs.extensions }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find extension directories
+        id: discover
+        run: |
+          EXTENSIONS=$(find . -name manifest.yaml -not -path './.git/*' \
+            -not -path '*/.swamp/*' -printf '%h\n' \
+            | sed 's|^\./||' | sort | jq -R . | jq -sc .)
+          echo "extensions=$EXTENSIONS" >> "$GITHUB_OUTPUT"
+          echo "Discovered: $EXTENSIONS"
+          if [ "$EXTENSIONS" = "[]" ]; then
+            echo "::error::No manifest.yaml found — nothing to check"
+            exit 1
+          fi
+
+  extension-check:
+    # One job per extension, four tasks as steps. GitHub caps a matrix at 256
+    # jobs per run, so N extensions x 1 job scales where N x 4 would not.
+    needs: [discover]
+    name: ${{ matrix.extension }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        extension: ${{ fromJson(needs.discover.outputs.extensions) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.extension }}
+    steps:
+      - uses: actions/checkout@v4
+      # Cache the Deno binary in the runner tool cache so this job skips the
+      # download. denoland/setup-deno short-circuits when tc.find resolves,
+      # which protects against release-CDN flakes failing parallel jobs.
+      - name: Cache Deno binary
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.tool_cache }}/deno
+          key: deno-tool-${{ runner.os }}-${{ runner.arch }}-${{ env.DENO_VERSION }}
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: ${{ env.DENO_VERSION }}
+      - name: deno check
+        run: deno task check
+      - name: deno lint
+        run: deno task lint
+      - name: deno fmt
+        run: deno task fmt:check
+      - name: deno test
+        run: deno task test
+
+  manifest-validate:
+    name: Validate manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: systeminit/setup-swamp@v0.1.0
+      - name: Validate all manifests
+        run: |
+          for manifest in $(find . -name "manifest.yaml" -not -path "./.git/*"); do
+            dir=$(dirname "$manifest")
+            echo "Validating $manifest"
+            (cd "$dir" && swamp extension fmt manifest.yaml --check)
+          done
+      - name: Enforce inline import specifiers (no bare specifiers)
+        # The registry quality scorer cannot resolve bare import specifiers
+        # (e.g. `from "zod"`); such extensions publish but score as UNSCORED.
+        # deno check/lint/test all pass with bare imports, so this is the only
+        # place CI can catch the regression. See CLAUDE.md
+        # "Dependency Import Specifiers (HARD RULE)".
+        run: |
+          matches=$(grep -rnE 'from "(zod|postgres|ioredis)"' \
+            --include="*.ts" \
+            --exclude="*_test.ts" \
+            --exclude-dir=.swamp \
+            $(find . -type d -name extensions -not -path "*/.swamp/*") 2>/dev/null || true)
+          if [ -n "$matches" ]; then
+            echo "::error::Bare import specifier(s) found in shipped source. Use inline npm:/jsr: pins (e.g. \"npm:zod@4\")."
+            echo "$matches"
+            exit 1
+          fi
+          # Enforce a single consistent zod pin across shipped extension source.
+          pins=$(grep -rhoE 'from "npm:zod@[^"]*"' \
+            --include="*.ts" \
+            --exclude-dir=.swamp \
+            . 2>/dev/null | sort -u)
+          count=$(printf '%s\n' "$pins" | grep -c . || true)
+          if [ "$count" -gt 1 ]; then
+            echo "::error::Inconsistent zod pins across extensions — must be identical everywhere:"
+            printf '%s\n' "$pins"
+            exit 1
+          fi
+          echo "Import specifier check passed (zod pin: ${pins:-none})"
+
+  model-type-literal:
+    # swamp's static extractor reads `type:` out of the export block textually.
+    # A constant reference compiles and loads fine but publishes without the
+    # type recorded, so nothing but a grep catches it.
+    name: Enforce string-literal model type
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check every model declares type as a string literal
+        run: |
+          bad=$(grep -rn --include="*.ts" --exclude="*_test.ts" \
+            -A3 'export const model' \
+            $(find . -type d -name models -not -path "*/.swamp/*") 2>/dev/null \
+            | grep -E 'type:\s*[A-Za-z_$]' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::A model declares type: from a constant. Use a string literal, e.g. type: \"@aspec451/vendor/name\"."
+            echo "$bad"
+            exit 1
+          fi
+          echo "All models declare type as a string literal"
