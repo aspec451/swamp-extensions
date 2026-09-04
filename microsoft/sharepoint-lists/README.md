@@ -113,9 +113,22 @@ paginating at `maxPages` (default 20) and report `truncated`. When it is true,
 `filter`. For `get_list` it means `writableColumns` may be incomplete, so treat
 a write built from it as unverified until the walk completes.
 
-**`delete_item` reads before deleting.** A DELETE returns 204 and Graph cannot
-reach SharePoint's recycle bin, so the pre-delete field values persisted in the
-`itemWrite` resource are the only record of what was removed.
+**`delete_item` reads before deleting, and is idempotent.** A DELETE returns 204
+and Graph cannot reach SharePoint's recycle bin, so the pre-delete field values
+persisted in the `itemWrite` resource are the only record of what was removed.
+That pre-image is written *before* the DELETE is issued and rewritten after,
+so an interruption between the two leaves the record behind rather than
+nothing — `deleteConfirmed` separates the two states. An item that is already
+gone succeeds with `alreadyAbsent: true` instead of failing, so a retried
+delete is safe.
+
+**Throttled and transient responses retry automatically.** Graph throttles the
+list surface aggressively, and a long paginated walk is what trips it. A 429,
+503 or 504 is retried up to three times, honouring `Retry-After` when present
+and backing off exponentially from one second when it is not, capped at 30s per
+wait. Retries happen per request, so a throttle partway through a paginated
+walk no longer discards the pages already collected. Other statuses — including
+404 and 403 — fail immediately.
 
 **`invalid_grant` on any method** means the refresh token expired (90 days of
 inactivity) or was revoked. Re-run `bootstrap` and update the vault. Changing

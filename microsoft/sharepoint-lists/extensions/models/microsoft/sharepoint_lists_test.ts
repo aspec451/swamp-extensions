@@ -869,6 +869,102 @@ Deno.test("delete_item: reads the item before deleting and keeps the pre-image",
 // Error context
 // ---------------------------------------------------------------------------
 
+Deno.test("delete_item: an already-deleted item succeeds as alreadyAbsent", async () => {
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: GLOBAL_ARGS,
+    definition: DEFINITION,
+  });
+
+  const { calls } = await withMockedFetch(
+    withListResolved((path, _u, req) =>
+      path === `/v1.0/sites/${SITE_ID}/lists/${LIST_ID}/items/7` &&
+        req.method === "GET"
+        ? graphError("itemNotFound", "Item not found", 404)
+        : undefined
+    ),
+    () =>
+      model.methods.delete_item.execute(
+        { list: LIST_ID, itemId: "7", confirm: true },
+        context as ExecCtx,
+      ),
+  );
+
+  // Deleting what is already gone is a no-op that reports success, not a
+  // failure — the requested end state already holds.
+  const data = getWrittenResources()[0].data;
+  assertEquals(data.operation, "delete");
+  assertEquals(data.alreadyAbsent, true);
+  assertEquals(data.deleteConfirmed, true);
+  assertEquals(data.fields, {});
+  // Nothing was destroyed on the way to that conclusion.
+  assertEquals(calls.some((c) => c.method === "DELETE"), false);
+});
+
+Deno.test("delete_item: a non-404 read failure still fails the delete", async () => {
+  const { context } = createModelTestContext({
+    globalArgs: GLOBAL_ARGS,
+    definition: DEFINITION,
+  });
+
+  await withMockedFetch(
+    withListResolved((path, _u, req) =>
+      path === `/v1.0/sites/${SITE_ID}/lists/${LIST_ID}/items/7` &&
+        req.method === "GET"
+        ? graphError("accessDenied", "Forbidden", 403)
+        : undefined
+    ),
+    async () => {
+      const err = await assertRejects(
+        () =>
+          model.methods.delete_item.execute(
+            { list: LIST_ID, itemId: "7", confirm: true },
+            context as ExecCtx,
+          ),
+        Error,
+      );
+      // A 403 must not be mistaken for "already gone".
+      assertStringIncludes(err.message, "before delete");
+      assertStringIncludes(err.message, "Forbidden");
+    },
+  );
+});
+
+Deno.test("delete_item: the pre-image is persisted before the DELETE is issued", async () => {
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: GLOBAL_ARGS,
+    definition: DEFINITION,
+  });
+
+  await withMockedFetch(
+    withListResolved((path, _u, req) => {
+      const itemPath = `/v1.0/sites/${SITE_ID}/lists/${LIST_ID}/items/7`;
+      if (path === itemPath && req.method === "GET") {
+        return json({ id: "7", fields: { Title: "Doomed" } });
+      }
+      if (path === itemPath && req.method === "DELETE") {
+        return new Response(null, { status: 204 });
+      }
+      return undefined;
+    }),
+    () =>
+      model.methods.delete_item.execute(
+        { list: LIST_ID, itemId: "7", confirm: true },
+        context as ExecCtx,
+      ),
+  );
+
+  const written = getWrittenResources();
+  // Two versions: the unconfirmed pre-image, then the confirmed record. An
+  // interruption between them leaves the pre-image behind rather than nothing.
+  assertEquals(written.length, 2);
+  assertEquals(written[0].data.deleteConfirmed, false);
+  assertEquals(written[0].data.fields, { Title: "Doomed" });
+  assertEquals(written[1].data.deleteConfirmed, true);
+  assertEquals(written[1].data.fields, { Title: "Doomed" });
+  // Both are versions of one instance, not two competing records.
+  assertEquals(written[0].name, written[1].name);
+});
+
 Deno.test("errors carry the operation and the Graph error message", async () => {
   const { context } = createModelTestContext({
     globalArgs: GLOBAL_ARGS,

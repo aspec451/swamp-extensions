@@ -17,7 +17,11 @@ import {
   pollDeviceCode,
   refreshAccessToken,
 } from "./_lib/auth.ts";
-import { graphRequest, graphRequestPaginated } from "./_lib/graph.ts";
+import {
+  GraphApiError,
+  graphRequest,
+  graphRequestPaginated,
+} from "./_lib/graph.ts";
 
 const EXTENSION_NAME = "@aspec451/microsoft/sharepoint-lists";
 
@@ -182,6 +186,13 @@ const ItemWriteSchema = z.object({
     "Resulting field values for create/update; the deleted item's values for delete",
   ),
   webUrl: z.string().nullable().optional().describe("Browser URL for the item"),
+  alreadyAbsent: z.boolean().optional().describe(
+    "For delete: the item was already gone, so nothing was removed",
+  ),
+  deleteConfirmed: z.boolean().optional().describe(
+    "For delete: true once Graph confirmed removal. A record with false is a " +
+      "pre-image written before the DELETE was issued — the item may still exist",
+  ),
   ...MetaFields,
 });
 
@@ -971,7 +982,8 @@ export const model = {
       description:
         "Delete one list item. Requires confirm=true. The item's field values " +
         "are read and persisted before the delete, so the itemWrite resource " +
-        "is a record of what was removed.",
+        "is a record of what was removed. Idempotent: an item that is already " +
+        "gone succeeds with alreadyAbsent=true rather than failing.",
       arguments: z.object({
         list: z.string().min(1, "list must not be empty").describe(
           "List GUID, URL name, or display name",
@@ -1004,20 +1016,77 @@ export const model = {
         );
         const list = await resolveList(accessToken, site.id, args.list);
 
+        const itemPath = `/sites/${site.id}/lists/${list.id}/items/${
+          encodeURIComponent(args.itemId)
+        }`;
+        const instanceName = slug(
+          `delete-${list.displayName ?? list.id}-${args.itemId}`,
+          "delete",
+        );
+        const record = {
+          siteId: site.id,
+          siteHostPath: context.globalArgs.siteHostPath,
+          operation: "delete",
+          listId: list.id,
+          listName: list.displayName ?? list.name ?? list.id,
+          itemId: args.itemId,
+          collectedBy: EXTENSION_NAME,
+        };
+
         // Read before deleting. A delete that returns 204 tells you nothing
         // about what was in the row, and SharePoint's recycle bin is not
         // reachable from Graph — so the pre-image is the only record.
-        const existing = await withGraphContext(
-          `Failed to read item "${args.itemId}" in "${args.list}" before delete`,
-          () =>
-            graphRequest<GraphListItem>(
-              accessToken,
-              "GET",
-              `/sites/${site.id}/lists/${list.id}/items/${
-                encodeURIComponent(args.itemId)
-              }?$expand=fields`,
-            ),
-        );
+        let existing: GraphListItem;
+        try {
+          existing = await graphRequest<GraphListItem>(
+            accessToken,
+            "GET",
+            `${itemPath}?$expand=fields`,
+          );
+        } catch (e) {
+          if (!(e instanceof GraphApiError) || e.statusCode !== 404) {
+            throw new Error(
+              `Failed to read item "${args.itemId}" in "${args.list}" before ` +
+                `delete: ${e instanceof Error ? e.message : String(e)}`,
+              { cause: e },
+            );
+          }
+
+          // Already gone. The requested end state holds, so report success
+          // rather than failing a delete with nothing left to do.
+          const absent = await context.writeResource(
+            "itemWrite",
+            instanceName,
+            {
+              ...record,
+              fields: {},
+              webUrl: null,
+              alreadyAbsent: true,
+              deleteConfirmed: true,
+              fetchedAt: new Date().toISOString(),
+              durationMs: Date.now() - startMs,
+            },
+          );
+
+          context.logger.info(
+            "Item {id} is already absent from {name} — nothing to delete",
+            { id: args.itemId, name: list.displayName ?? args.list },
+          );
+          return { dataHandles: [absent] };
+        }
+
+        // Persist the pre-image BEFORE issuing the DELETE. If the process dies
+        // between the two, what the row held still survives; deleteConfirmed
+        // is what separates that record from a completed one.
+        await context.writeResource("itemWrite", instanceName, {
+          ...record,
+          fields: existing.fields ?? {},
+          webUrl: existing.webUrl ?? null,
+          alreadyAbsent: false,
+          deleteConfirmed: false,
+          fetchedAt: new Date().toISOString(),
+          durationMs: Date.now() - startMs,
+        });
 
         await withGraphContext(
           `Failed to delete item "${args.itemId}" in "${args.list}"`,
@@ -1025,32 +1094,19 @@ export const model = {
             graphRequest<Record<string, never>>(
               accessToken,
               "DELETE",
-              `/sites/${site.id}/lists/${list.id}/items/${
-                encodeURIComponent(args.itemId)
-              }`,
+              itemPath,
             ),
         );
 
-        const handle = await context.writeResource(
-          "itemWrite",
-          slug(
-            `delete-${list.displayName ?? list.id}-${args.itemId}`,
-            "delete",
-          ),
-          {
-            siteId: site.id,
-            siteHostPath: context.globalArgs.siteHostPath,
-            operation: "delete",
-            listId: list.id,
-            listName: list.displayName ?? list.name ?? list.id,
-            itemId: args.itemId,
-            fields: existing.fields ?? {},
-            webUrl: existing.webUrl ?? null,
-            fetchedAt: new Date().toISOString(),
-            durationMs: Date.now() - startMs,
-            collectedBy: EXTENSION_NAME,
-          },
-        );
+        const handle = await context.writeResource("itemWrite", instanceName, {
+          ...record,
+          fields: existing.fields ?? {},
+          webUrl: existing.webUrl ?? null,
+          alreadyAbsent: false,
+          deleteConfirmed: true,
+          fetchedAt: new Date().toISOString(),
+          durationMs: Date.now() - startMs,
+        });
 
         context.logger.info("Deleted item {id} from {name}", {
           id: args.itemId,

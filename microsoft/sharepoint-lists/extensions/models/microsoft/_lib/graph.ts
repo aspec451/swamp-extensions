@@ -4,8 +4,9 @@
 // Adapted from @webframp/microsoft/teams (Sean Escriva,
 // https://github.com/webframp/swamp-extensions), licensed under the Apache
 // License 2.0. Changed from the original: the paginated helper returns a
-// truncated flag alongside the accumulated items, and the page cap is a
-// parameter rather than a module constant.
+// truncated flag alongside the accumulated items, the page cap is a parameter
+// rather than a module constant, and requests retry throttled and transient
+// responses honouring Retry-After.
 
 export const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 
@@ -33,6 +34,57 @@ export class GraphApiError extends Error {
 }
 
 // ---------------------------------------------------------------------------
+// Retry policy
+// ---------------------------------------------------------------------------
+
+/**
+ * Statuses worth retrying. 429 is Graph's throttle; SharePoint list endpoints
+ * throttle aggressively, and a long paginated walk is exactly the shape that
+ * trips it. 503/504 are transient backend faults that Graph's own guidance
+ * says to retry.
+ */
+const RETRYABLE_STATUS = new Set([429, 503, 504]);
+
+/** How hard to retry a throttled or transient response. */
+export interface RetryOptions {
+  /** Retries after the first attempt. Default 3; 0 disables retrying. */
+  maxRetries?: number;
+  /** Ceiling on any single wait, in milliseconds. Default 30_000. */
+  maxDelayMs?: number;
+  /** Injectable for tests, so a retry path does not really sleep. */
+  sleepFn?: (ms: number) => Promise<void>;
+}
+
+const defaultSleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * How long to wait before retrying. `Retry-After` wins when present — Graph
+ * sends it in seconds, but the HTTP spec also permits a date, so both are
+ * handled. Without it, back off exponentially from one second.
+ */
+export function retryDelayMs(
+  response: Response,
+  attempt: number,
+  maxDelayMs: number,
+): number {
+  const header = response.headers.get("Retry-After");
+
+  if (header !== null) {
+    const seconds = Number(header);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return Math.min(seconds * 1000, maxDelayMs);
+    }
+    const until = Date.parse(header);
+    if (!Number.isNaN(until)) {
+      return Math.min(Math.max(until - Date.now(), 0), maxDelayMs);
+    }
+  }
+
+  return Math.min(1000 * 2 ** attempt, maxDelayMs);
+}
+
+// ---------------------------------------------------------------------------
 // Single-resource request
 // ---------------------------------------------------------------------------
 
@@ -48,6 +100,7 @@ export async function graphRequest<T>(
   body?: unknown,
   extraHeaders?: Record<string, string>,
   fetchFn: typeof fetch = fetch,
+  retry: RetryOptions = {},
 ): Promise<T> {
   const url = path.startsWith("https://") ? path : `${GRAPH_BASE}${path}`;
   const headers: Record<string, string> = {
@@ -56,31 +109,68 @@ export async function graphRequest<T>(
     ...extraHeaders,
   };
 
-  const response = await fetchFn(url, {
-    method,
-    headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
+  const maxRetries = retry.maxRetries ?? 3;
+  const maxDelayMs = retry.maxDelayMs ?? 30_000;
+  const sleepFn = retry.sleepFn ?? defaultSleep;
 
-  if (response.status === 204) {
-    // No content — return empty object.
-    return {} as T;
+  for (let attempt = 0;; attempt++) {
+    const response = await fetchFn(url, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+
+    if (RETRYABLE_STATUS.has(response.status) && attempt < maxRetries) {
+      const delayMs = retryDelayMs(response, attempt, maxDelayMs);
+      // Drain the body before discarding the response so the connection is
+      // released rather than leaked for the lifetime of the walk.
+      await response.text().catch(() => {});
+      await sleepFn(delayMs);
+      continue;
+    }
+
+    if (response.status === 204) {
+      // No content — return empty object.
+      return {} as T;
+    }
+
+    // Parse only after the status is known to be final, and tolerate a body
+    // that is not JSON: an error from a proxy or gateway is often HTML, and
+    // reporting the status beats a SyntaxError from the parser.
+    const raw = await response.text();
+    let data: Record<string, unknown>;
+    try {
+      data = (raw ? JSON.parse(raw) : {}) as Record<string, unknown>;
+    } catch {
+      if (!response.ok) {
+        throw new GraphApiError(
+          response.status,
+          "non_json_response",
+          `Graph API error ${response.status}: ${
+            raw.slice(0, 200) || response.statusText
+          }`,
+        );
+      }
+      throw new GraphApiError(
+        response.status,
+        "non_json_response",
+        `Graph returned a non-JSON body for ${method} ${path}`,
+      );
+    }
+
+    if (!response.ok) {
+      const err = data["error"] as
+        | { code?: string; message?: string }
+        | undefined;
+      throw new GraphApiError(
+        response.status,
+        String(err?.code ?? "unknown"),
+        String(err?.message ?? `Graph API error ${response.status}`),
+      );
+    }
+
+    return data as T;
   }
-
-  const data = await response.json() as Record<string, unknown>;
-
-  if (!response.ok) {
-    const err = data["error"] as
-      | { code?: string; message?: string }
-      | undefined;
-    throw new GraphApiError(
-      response.status,
-      String(err?.code ?? "unknown"),
-      String(err?.message ?? `Graph API error ${response.status}`),
-    );
-  }
-
-  return data as T;
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +194,7 @@ export async function graphRequestPaginated<T>(
   extraHeaders?: Record<string, string>,
   fetchFn: typeof fetch = fetch,
   maxPages: number = 20,
+  retry: RetryOptions = {},
 ): Promise<PaginatedResult<T>> {
   const allItems: T[] = [];
 
@@ -128,6 +219,7 @@ export async function graphRequestPaginated<T>(
       undefined,
       extraHeaders,
       fetchFn,
+      retry,
     );
 
     allItems.push(...(page.value ?? []));
