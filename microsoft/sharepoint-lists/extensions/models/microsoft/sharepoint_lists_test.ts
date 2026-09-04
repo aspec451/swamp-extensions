@@ -366,7 +366,7 @@ Deno.test("get_list: resolves a list by display name after the direct lookup 404
     }),
     () =>
       model.methods.get_list.execute(
-        { list: "Project Tracker", includeHidden: false },
+        { list: "Project Tracker", includeHidden: false, maxPages: 20 },
         context as ExecCtx,
       ),
   );
@@ -406,7 +406,7 @@ Deno.test("get_list: a list that matches nothing names the lists that do exist",
       const err = await assertRejects(
         () =>
           model.methods.get_list.execute(
-            { list: "Nope", includeHidden: false },
+            { list: "Nope", includeHidden: false, maxPages: 20 },
             context as ExecCtx,
           ),
         Error,
@@ -738,6 +738,88 @@ Deno.test("update_item: patches the fields subresource without a wrapper object"
   assertEquals(data.operation, "update");
   assertEquals(data.itemId, "7");
   assertEquals(data.fields, { Title: "First", Status: "Closed" });
+});
+
+Deno.test("update_item: a 204 PATCH keeps the submitted fields in the audit record", async () => {
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: GLOBAL_ARGS,
+    definition: DEFINITION,
+  });
+
+  await withMockedFetch(
+    withListResolved((path, _u, req) =>
+      path === `/v1.0/sites/${SITE_ID}/lists/${LIST_ID}/items/7/fields` &&
+        req.method === "PATCH"
+        // Graph may answer a field PATCH with 204 and no body.
+        ? new Response(null, { status: 204 })
+        : undefined
+    ),
+    () =>
+      model.methods.update_item.execute(
+        { list: LIST_ID, itemId: "7", fields: { Status: "Closed" } },
+        context as ExecCtx,
+      ),
+  );
+
+  // The itemWrite resource is the record of what changed, so an empty body
+  // must not erase it — the submitted fields stand in.
+  const data = getWrittenResources()[0].data;
+  assertEquals(data.fields, { Status: "Closed" });
+});
+
+Deno.test("get_list: hitting the column page cap sets truncated and warns", async () => {
+  const { context, getWrittenResources, getLogs } = createModelTestContext({
+    globalArgs: GLOBAL_ARGS,
+    definition: DEFINITION,
+  });
+
+  await withMockedFetch(
+    withListResolved((path, _u, _req) =>
+      path === `/v1.0/sites/${SITE_ID}/lists/${LIST_ID}/columns`
+        ? json({
+          value: [{ name: "Title", text: {} }],
+          "@odata.nextLink":
+            `https://graph.microsoft.com/v1.0/sites/${SITE_ID}/lists/${LIST_ID}/columns?$skiptoken=2`,
+        })
+        : undefined
+    ),
+    () =>
+      model.methods.get_list.execute(
+        { list: LIST_ID, includeHidden: false, maxPages: 1 },
+        context as ExecCtx,
+      ),
+  );
+
+  const data = getWrittenResources()[0].data;
+  assertEquals(data.truncated, true);
+  assertEquals((data.columns as unknown[]).length, 1);
+
+  const warned = getLogs().some((l: { message: string }) =>
+    l.message.includes("maxPages cap")
+  );
+  assertEquals(warned, true, "expected a warning that columns are incomplete");
+});
+
+Deno.test("get_list: an exhausted column walk reports truncated false", async () => {
+  const { context, getWrittenResources } = createModelTestContext({
+    globalArgs: GLOBAL_ARGS,
+    definition: DEFINITION,
+  });
+
+  await withMockedFetch(
+    withListResolved((path, _u, _req) =>
+      path === `/v1.0/sites/${SITE_ID}/lists/${LIST_ID}/columns`
+        ? json({ value: [{ name: "Title", text: {} }] })
+        : undefined
+    ),
+    () =>
+      model.methods.get_list.execute(
+        { list: LIST_ID, includeHidden: false, maxPages: 20 },
+        context as ExecCtx,
+      ),
+  );
+
+  assertEquals(getWrittenResources()[0].data.truncated, false);
 });
 
 Deno.test("delete_item: reads the item before deleting and keeps the pre-image", async () => {

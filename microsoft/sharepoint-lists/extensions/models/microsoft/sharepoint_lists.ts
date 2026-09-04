@@ -130,6 +130,9 @@ const ListSchemaResourceSchema = z.object({
   writableColumns: z.array(z.string()).describe(
     "Internal names of columns that accept writes",
   ),
+  truncated: z.boolean().describe(
+    "Whether the fetch hit maxPages before exhausting the column list",
+  ),
   ...MetaFields,
 });
 
@@ -616,9 +619,12 @@ export const model = {
         includeHidden: z.boolean().default(false).describe(
           "Include hidden columns in the output",
         ),
+        maxPages: z.number().int().min(1).max(50).default(20).describe(
+          "Cap on @odata.nextLink pages followed",
+        ),
       }),
       execute: async (
-        args: { list: string; includeHidden: boolean },
+        args: { list: string; includeHidden: boolean; maxPages: number },
         context: Context,
       ) => {
         const startMs = Date.now();
@@ -635,8 +641,21 @@ export const model = {
             graphRequestPaginated<GraphColumn>(
               accessToken,
               `/sites/${site.id}/lists/${list.id}/columns`,
+              undefined,
+              undefined,
+              fetch,
+              args.maxPages,
             ),
         );
+
+        if (result.truncated) {
+          context.logger.warn(
+            "Hit the maxPages cap ({cap}) before exhausting the column list — " +
+              "{count} column(s) is a floor, and writableColumns may be " +
+              "incomplete. Raise maxPages.",
+            { cap: args.maxPages, count: result.items.length },
+          );
+        }
 
         const columns = result.items
           .map(mapColumn)
@@ -653,6 +672,7 @@ export const model = {
             writableColumns: columns
               .filter((c) => !c.readOnly)
               .map((c) => c.name),
+            truncated: result.truncated,
             fetchedAt: new Date().toISOString(),
             durationMs: Date.now() - startMs,
             collectedBy: EXTENSION_NAME,
@@ -906,6 +926,14 @@ export const model = {
             ),
         );
 
+        // Graph normally answers this PATCH with the updated field map, but it
+        // can answer 204 with no body — graphRequest yields {} then, which is
+        // not nullish, so `??` would persist an empty record and lose the only
+        // account of what changed. Fall back on emptiness, not nullishness.
+        const resultFields = Object.keys(updated).length > 0
+          ? updated
+          : args.fields;
+
         const handle = await context.writeResource(
           "itemWrite",
           slug(
@@ -919,7 +947,7 @@ export const model = {
             listId: list.id,
             listName: list.displayName ?? list.name ?? list.id,
             itemId: args.itemId,
-            fields: updated ?? args.fields,
+            fields: resultFields,
             webUrl: null,
             fetchedAt: new Date().toISOString(),
             durationMs: Date.now() - startMs,

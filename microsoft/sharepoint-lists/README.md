@@ -107,9 +107,11 @@ whenever a filter or sort is supplied, which converts a flat HTTP 400 into a
 call that usually works but may fail intermittently on a large list. Index the
 column in SharePoint if a filter matters operationally.
 
-**`list_items` truncation is a floor, not a total.** Pagination stops at
-`maxPages` (default 20). When `truncated: true`, `totalFetched` is a lower bound
-— raise `maxPages` or narrow with `filter`.
+**Truncation is a floor, not a total.** `list_items` and `get_list` both stop
+paginating at `maxPages` (default 20) and report `truncated`. When it is true,
+`list_items`' `totalFetched` is a lower bound — raise `maxPages` or narrow with
+`filter`. For `get_list` it means `writableColumns` may be incomplete, so treat
+a write built from it as unverified until the walk completes.
 
 **`delete_item` reads before deleting.** A DELETE returns 204 and Graph cannot
 reach SharePoint's recycle bin, so the pre-delete field values persisted in the
