@@ -3,12 +3,13 @@
 //
 // Adapted from @webframp/microsoft/teams (Sean Escriva,
 // https://github.com/webframp/swamp-extensions), licensed under the Apache
-// License 2.0, so the SharePoint Lists model
-// authenticates the same way as the Teams model in this family. The one
-// structural change is that scopes are a parameter rather than a module
-// constant: a refresh token is bound to the scopes it was issued with, and a
-// tenant that will consent to Sites.Read.All but not Sites.ReadWrite.All needs
-// to bootstrap with a narrower set.
+// License 2.0. That license continues to govern the portions derived from it;
+// the Apache-2.0 notice above is retained per its section 4(b).
+//
+// Changed from the original: scopes are a parameter rather than a module
+// constant, because a refresh token is bound to the scopes it was issued with,
+// and a tenant that will consent to Sites.Read.All but not Sites.ReadWrite.All
+// needs to bootstrap with a narrower set.
 
 const TOKEN_ENDPOINT_BASE = "https://login.microsoftonline.com";
 
@@ -64,6 +65,37 @@ export const DEFAULT_SHAREPOINT_SCOPES = [
 ].join(" ");
 
 // ---------------------------------------------------------------------------
+// Response parsing
+// ---------------------------------------------------------------------------
+
+/**
+ * Read a token-endpoint response body as JSON, tolerating a body that is not
+ * JSON at all.
+ *
+ * A proxy or gateway in front of login.microsoftonline.com answers with HTML,
+ * and `response.json()` on that throws a SyntaxError that hides the status
+ * that actually explains the failure. Surfacing the status as a
+ * MicrosoftAuthError keeps a 502 from being reported as a parser fault.
+ * `_lib/graph.ts` handles Graph responses the same way.
+ */
+async function readTokenBody(
+  response: Response,
+  operation: string,
+): Promise<Record<string, unknown>> {
+  const raw = await response.text();
+  try {
+    return (raw ? JSON.parse(raw) : {}) as Record<string, unknown>;
+  } catch {
+    throw new MicrosoftAuthError(
+      "non_json_response",
+      `${operation} returned a non-JSON body (HTTP ${response.status} ${
+        response.statusText || "no status text"
+      }): ${raw.slice(0, 200)}`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Token refresh (public client — no client_secret)
 // ---------------------------------------------------------------------------
 
@@ -93,7 +125,7 @@ export async function refreshAccessToken(
     body: body.toString(),
   });
 
-  const data = await response.json() as Record<string, unknown>;
+  const data = await readTokenBody(response, "Token refresh");
 
   if (!response.ok || data["error"]) {
     const errorCode = String(data["error"] ?? "unknown");
@@ -140,8 +172,9 @@ export async function initiateDeviceCode(
     body: body.toString(),
   });
 
+  const data = await readTokenBody(response, "Device code initiation");
+
   if (!response.ok) {
-    const data = await response.json() as Record<string, unknown>;
     throw new MicrosoftAuthError(
       String(data["error"] ?? "device_code_error"),
       String(
@@ -150,7 +183,7 @@ export async function initiateDeviceCode(
     );
   }
 
-  return response.json() as Promise<DeviceCodeResponse>;
+  return data as unknown as DeviceCodeResponse;
 }
 
 /**
@@ -186,7 +219,7 @@ export async function pollDeviceCode(
       body: body.toString(),
     });
 
-    const data = await response.json() as Record<string, unknown>;
+    const data = await readTokenBody(response, "Device code polling");
 
     if (response.ok && data["access_token"]) {
       return data as unknown as TokenResponse;

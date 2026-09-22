@@ -1,7 +1,8 @@
 // Graph helper tests — retry policy and error-body handling.
 // SPDX-License-Identifier: Apache-2.0
+// deno-lint-ignore-file no-import-prefix
 
-import { assertEquals, assertRejects } from "jsr:@std/assert@1.0.19";
+import { assertEquals, assertRejects } from "jsr:@std/assert@1";
 import {
   GraphApiError,
   graphRequest,

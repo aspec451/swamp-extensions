@@ -1,12 +1,15 @@
 // Microsoft Graph API Helper
-// Shared fetch utilities for the Microsoft models in this repo.
+// Shared fetch utilities for the SharePoint Lists model.
 //
 // Adapted from @webframp/microsoft/teams (Sean Escriva,
 // https://github.com/webframp/swamp-extensions), licensed under the Apache
-// License 2.0. Changed from the original: the paginated helper returns a
-// truncated flag alongside the accumulated items, the page cap is a parameter
-// rather than a module constant, and requests retry throttled and transient
-// responses honouring Retry-After.
+// License 2.0. That license continues to govern the portions derived from it;
+// the Apache-2.0 notice above is retained per its section 4(b).
+//
+// Changed from the original: the paginated helper returns a truncated flag
+// alongside the accumulated items, the page cap is a parameter rather than a
+// module constant, and requests retry throttled and transient responses
+// honouring Retry-After.
 
 export const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 

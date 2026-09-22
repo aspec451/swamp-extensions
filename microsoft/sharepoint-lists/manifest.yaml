@@ -1,7 +1,15 @@
 manifestVersion: 1
 name: "@aspec451/microsoft/sharepoint-lists"
-version: "2026.09.04.1"
-description: "SharePoint list items via the Microsoft Graph API — read and write rows on the list surface (public client, device code flow)"
+version: "2026.09.22.1"
+description: >
+  SharePoint list items via the Microsoft Graph API — read and write rows on
+  the list surface (/sites/{site}/lists/...), not the document library.
+  Authenticates as an Entra public client through the device code flow, so
+  there is no client secret, and every call runs as the signed-in user.
+  Methods: bootstrap, list_lists, get_list, list_items, list_changes,
+  create_item, update_item, delete_item. list_changes diffs a list against a
+  baseline it keeps itself, so it reports what moved column by column rather
+  than which rows were merely touched.
 repository: "https://github.com/aspec451/swamp-extensions"
 models:
   - microsoft/sharepoint_lists.ts
@@ -18,3 +26,6 @@ labels:
   - microsoft365
   - sharepoint
   - graph-api
+  - lists
+  - device-code
+  - change-tracking
